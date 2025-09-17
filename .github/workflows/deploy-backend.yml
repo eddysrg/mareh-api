@@ -37,7 +37,8 @@ jobs:
         mkdir -p bootstrap/cache
         
         # Crear archivo comprimido optimizado
-        tar --exclude='*.log' \
+        tar --exclude='deployment.tar.gz' \
+            --exclude='*.log' \
             --exclude='storage/framework/cache/*' \
             --exclude='storage/framework/sessions/*' \
             --exclude='storage/framework/views/*' \
