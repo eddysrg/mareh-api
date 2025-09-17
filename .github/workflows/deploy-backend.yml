@@ -5,8 +5,12 @@ on:
     branches: [ main, develop ]
   workflow_dispatch:
 
+env:
+  NODE_VERSION: '18'
+  PHP_VERSION: '8.3'
+
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: github.ref == 'refs/heads/main'
@@ -18,164 +22,35 @@ jobs:
     - name: Setup PHP
       uses: shivammathur/setup-php@v2
       with:
-        php-version: '8.3'
+        php-version: ${{ env.PHP_VERSION }}
         extensions: mbstring, curl, dom, fileinfo, json, mbstring, openssl, pdo_mysql, tokenizer, xml, zip
-        coverage: none
+        tools: composer:v2
 
     - name: Install production dependencies
       run: |
-        composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist
+        composer install --no-dev --optimize-autoloader --no-interaction
         composer dump-autoload --optimize --no-dev
-
-    - name: Prepare deployment package
+    - name: Setup Laravel environment
       run: |
-        # Limpiar archivos innecesarios
-        rm -rf node_modules tests .git .github storage/logs/* || true
-      
-        # Crear directorios necesarios
-        mkdir -p storage/logs storage/framework/cache storage/framework/sessions storage/framework/views
-        mkdir -p bootstrap/cache
-        
-        # Crear archivo comprimido optimizado
-        tar --exclude='deployment.tar.gz' \
-            --exclude='*.log' \
-            --exclude='storage/framework/cache/*' \
-            --exclude='storage/framework/sessions/*' \
-            --exclude='storage/framework/views/*' \
-            --exclude='.env*' \
-            --exclude='phpunit.xml' \
-            --exclude='*.md' \
-            -czf deployment.tar.gz .
-            
-        ls -lh deployment.tar.gz
-
-    - name: Create backup on server
-      uses: appleboy/ssh-action@v0.1.7
+        cp .env.example .env
+        php artisan key:generate
+        php artisan config:cache
+        php artisan route:cache
+    
+    - name: Deploy to server
+      if: github.ref == 'refs/heads/main'
+      uses: appleboy/ssh-action@v1.0.0
       with:
         host: ${{ secrets.HOST }}
         username: ${{ secrets.USERNAME }}
-        password: ${{ secrets.PASSWORD }}
-        port: ${{ secrets.PORT }}
-        timeout: 45s
         script: |
-          # Crear backup si existe la API
-          if [ -d "domains/marehasesores.com/public_html/api" ]; then
-            mkdir -p domains/marehasesores.com/backups
-            tar -czf domains/marehasesores.com/backups/api-backup-$(date +%Y%m%d-%H%M%S).tar.gz -C domains/marehasesores.com/public_html api/
-            echo "✅ API backup created"
-            
-            # Limpiar backups antiguos (mantener solo 5)
-            cd domains/marehasesores.com/backups
-            ls -t api-backup-*.tar.gz 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
-          fi
+          cd domains/marehasesores.com/public_html/api
+          git pull origin main
+          composer install --no-dev --optimize-autoloader
+          php artisan migrate --force
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+          php artisan queue:cache
 
-    - name: Upload deployment package
-      uses: appleboy/scp-action@v0.1.4
-      with:
-        host: ${{ secrets.HOST }}
-        username: ${{ secrets.USERNAME }}
-        password: ${{ secrets.PASSWORD }}
-        port: ${{ secrets.PORT }}
-        source: "deployment.tar.gz"
-        target: "/tmp/"
-        timeout: 180s
 
-    - name: Deploy and configure Laravel
-      uses: appleboy/ssh-action@v0.1.7
-      with:
-        host: ${{ secrets.HOST }}
-        username: ${{ secrets.USERNAME }}
-        password: ${{ secrets.PASSWORD }}
-        port: ${{ secrets.PORT }}
-        timeout: 120s
-        script: |
-          set -e  # Parar si hay error
-          
-          echo "🚀 Starting Laravel deployment..."
-          
-          # Crear estructura de directorios
-          cd domains/marehasesores.com/public_html/
-          mkdir -p api
-          cd api
-          
-          # Extraer nueva versión
-          if [ -f "/tmp/deployment.tar.gz" ]; then
-            tar -xzf /tmp/deployment.tar.gz
-            rm -f /tmp/deployment.tar.gz
-            echo "✅ Files extracted"
-          else
-            echo "❌ Deployment file not found"
-            exit 1
-          fi
-          
-          # Encontrar el ejecutable PHP correcto
-          PHP_PATH=""
-          for path in /usr/local/bin/php /usr/bin/php /opt/cpanel/ea-php81/root/usr/bin/php /bin/php; do
-            if [ -x "$path" ]; then
-              PHP_PATH="$path"
-              break
-            fi
-          done
-          
-          if [ -z "$PHP_PATH" ]; then
-            PHP_PATH="php"  # Fallback
-            echo "⚠️  Using fallback PHP path"
-          else
-            echo "✅ Using PHP: $PHP_PATH"
-          fi
-          
-          # Verificar Laravel
-          if [ ! -f "artisan" ]; then
-            echo "❌ Laravel artisan not found"
-            exit 1
-          fi
-          
-          # Ejecutar comandos Laravel (con manejo de errores)
-          echo "⚙️  Configuring Laravel..."
-          
-          $PHP_PATH artisan --version || echo "⚠️  Could not get Laravel version"
-          
-          # Cache de configuración
-          $PHP_PATH artisan config:clear 2>/dev/null || echo "⚠️  Config clear failed"
-          $PHP_PATH artisan config:cache 2>/dev/null || echo "⚠️  Config cache failed"
-          
-          # Cache de rutas
-          $PHP_PATH artisan route:clear 2>/dev/null || echo "⚠️  Route clear failed"
-          $PHP_PATH artisan route:cache 2>/dev/null || echo "⚠️  Route cache failed"
-          
-          # Cache de vistas
-          $PHP_PATH artisan view:clear 2>/dev/null || echo "⚠️  View clear failed"
-          $PHP_PATH artisan view:cache 2>/dev/null || echo "⚠️  View cache failed"
-          
-          # Optimizar autoloader
-          $PHP_PATH artisan optimize 2>/dev/null || echo "⚠️  Optimize failed"
-          
-          # Configurar permisos (intentar, no fallar si no se puede)
-          echo "🔐 Setting permissions..."
-          
-          find storage -type f -exec chmod 644 {} + 2>/dev/null || echo "⚠️  Could not set storage file permissions"
-          find storage -type d -exec chmod 755 {} + 2>/dev/null || echo "⚠️  Could not set storage directory permissions"
-          find bootstrap/cache -type f -exec chmod 644 {} + 2>/dev/null || true
-          find bootstrap/cache -type d -exec chmod 755 {} + 2>/dev/null || true
-          
-          # Verificar estructura crítica
-          echo "📋 Verifying deployment..."
-          
-          if [ -f "public/index.php" ]; then
-            echo "✅ Laravel entry point exists"
-          else
-            echo "❌ Laravel entry point missing"
-            exit 1
-          fi
-          
-          if [ -d "app/Http/Controllers" ]; then
-            echo "✅ Controllers directory exists"
-          else
-            echo "⚠️  Controllers directory not found"
-          fi
-          
-          # Mostrar estructura final
-          echo "📁 Final API structure:"
-          ls -la
-          
-          echo "✅ Backend deployment completed successfully"
